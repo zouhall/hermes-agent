@@ -25,6 +25,7 @@ from acp.schema import (
 )
 
 from acp_adapter.auth import TERMINAL_SETUP_AUTH_METHOD_ID, build_auth_methods, detect_provider
+from acp_adapter.clarify import make_clarify_callback
 from acp_adapter.commands import SlashCommandsMixin, _estimate_tokens
 from acp_adapter.content import PromptBlock, _content_blocks_to_openai_user_content, _extract_text
 from acp_adapter.events import (
@@ -224,6 +225,7 @@ class _TurnCallbacks:
     step_cb: Any = None
     stream_delta_cb: Any = None
     approval_cb: Any = None
+    clarify_cb: Any = None
     edit_approval_requester: Any = None
     streamed: bool = False
     tool_call_ids: Any = None
@@ -927,6 +929,9 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             # Closes the synthetic permission-request bubble once the user has answered.
             send_update = lambda update: _send_update(conn, session_id, loop, update)
             cbs.approval_cb = make_approval_callback(conn.request_permission, loop, session_id, send_update=send_update)
+            cbs.clarify_cb = make_clarify_callback(
+                conn.request_permission, loop, session_id, cancel_event=state.cancel_event, send_update=send_update,
+            )
             try:
                 from acp_adapter.edit_approval import make_acp_edit_approval_requester
 
@@ -943,6 +948,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         agent.thinking_callback = None
         agent.reasoning_callback, agent.step_callback = cbs.reasoning_cb, cbs.step_cb
         agent.stream_delta_callback = cbs.stream_delta_cb
+        agent.clarify_callback = cbs.clarify_cb
         return cbs
 
     async def _finish_turn(

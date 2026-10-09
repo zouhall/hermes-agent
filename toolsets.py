@@ -194,11 +194,11 @@ TOOLSETS = {
 
     # Full Hermes toolsets (CLI + messaging platforms). All share the core tools;
     # there is deliberately no agent-callable send_message tool. hermes-acp is the
-    # coding posture minus the interactive clarify UI.
+    # coding posture with clarify bridged through ACP permission cards.
     "hermes-acp": _ts(
         "Editor integration (VS Code, Zed, JetBrains) — coding-focused tools without "
-        "messaging, audio, or clarify UI",
-        [t for t in _CODING_TOOLS if t != "clarify"],
+        "messaging or audio; clarify uses ACP permission cards",
+        _CODING_TOOLS,
     ),
     "hermes-api-server": _ts(
         "OpenAI-compatible API server — full agent tools accessible via HTTP (no "

@@ -145,9 +145,16 @@ repair is session rotation, not another row.
 
 `cancel(session_id)`:
 
-- sets the session cancel event
-- calls `agent.interrupt()` when available
+- affects only the running turn; a late cancel while idle is ignored
+- sets the session cancel event and hard-interrupts the running agent
 - causes the prompt response to return `stop_reason="cancelled"`
+
+Ordinary prompts received while busy are queued with all content blocks intact and run
+after the active turn ends. A cancel followed by a prompt stops the old turn and starts
+the queued input with fresh interrupt state, before durable lease admission. If another
+process holds the lease, ACP retains the prompt and retries admission until it can run
+or the user cancels. `/steer` explicitly injects into an active turn; any guidance left
+unconsumed at turn end is queued for the next turn.
 
 ### Forking
 

@@ -21,6 +21,8 @@ from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from acp_adapter.content import PromptBlock
+
 logger = logging.getLogger(__name__)
 
 
@@ -144,7 +146,7 @@ class SessionState:
     # a bare is_running check in the slash thread would leave a check-then-act window where
     # a prompt claims the turn mid-mutation.
     command_op: bool = False
-    queued_prompts: list[str] = field(default_factory=list)
+    queued_prompts: list[list[PromptBlock]] = field(default_factory=list)
     runtime_lock: Any = field(default_factory=threading.Lock)
     current_prompt_text: str = ""
     interrupted_prompt_text: str = ""

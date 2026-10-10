@@ -649,7 +649,10 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         if not (state and state.cancel_event):
             return
         with state.runtime_lock:
-            if state.is_running and state.current_prompt_text:
+            # Cancelling an idle session must not poison its next prompt.
+            if not state.is_running:
+                return
+            if state.current_prompt_text:
                 state.interrupted_prompt_text = state.current_prompt_text
             # Cancel + hard-stop under the lock so no other prompt mistakes this turn for
             # redirectable work.
@@ -732,25 +735,25 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         return user_text, user_content
 
     def _claim_turn_or_queue(
-        self, state: SessionState, session_id: str, user_text: str, user_content: Any, text_only: bool
+        self, state: SessionState, user_text: str, prompt: list[PromptBlock]
     ) -> str | None:
-        """Mark the session running; if a turn is active, redirect it (text-only, supported
-        runtime) or queue it. Returns the client message when absorbed, else None."""
+        """Claim an idle session or retain the complete prompt for its next turn."""
         with state.runtime_lock:
             if not state.is_running and not state.command_op:
+                # Early core returns and a cancel during final delivery may leave the flag
+                # set. Clear BEFORE publishing the new turn, under cancel's same lock, so
+                # lease admission cannot mistake the previous stop for a new cancellation.
+                clear_interrupt = getattr(state.agent, "clear_interrupt", None)
+                if callable(clear_interrupt):
+                    clear_interrupt()
+                if state.cancel_event:
+                    state.cancel_event.clear()
                 state.is_running = True
                 state.current_prompt_text = user_text or "[Image attachment]"
                 return None
-            # Redirect steers a live turn; a state-mutating command (command_op) has none.
-            if state.is_running and text_only and isinstance(user_content, str) and hasattr(state.agent, "redirect") and (
-                getattr(state.agent, "_supports_active_turn_redirect", False) is True
-            ):
-                try:
-                    if state.agent.redirect(user_content):
-                        return "Redirected the active turn with your correction."
-                except Exception:
-                    logger.debug("ACP active-turn redirect failed for %s", session_id, exc_info=True)
-            state.queued_prompts.append(user_text or "[Image attachment]")
+            # Redirect may acknowledge a correction just as the cancelled turn exits.
+            # Ordinary prompts stay in the adapter queue; explicit /steer owns injection.
+            state.queued_prompts.append(list(prompt))
             return f"Queued for the next turn. ({len(state.queued_prompts)} queued)"
 
     def _run_agent_turn(
@@ -809,10 +812,16 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
 
             agent._on_session_title = _notify_title_update
             try:
-                return agent.run_conversation(
-                    user_message=user_content, conversation_history=state.history, task_id=session_id,
-                    persist_user_message=user_text or "[Image attachment]",
-                )
+                while True:
+                    result = agent.run_conversation(
+                        user_message=user_content, conversation_history=state.history, task_id=session_id,
+                        persist_user_message=user_text or "[Image attachment]",
+                    )
+                    if result.get("failure_reason") != "session_busy" or state.cancel_event.is_set():
+                        return result
+                    # A different ACP process can still own the durable lease. Its bounded
+                    # wait expired before admitting this input: keep it pending and retry.
+                    logger.info("ACP session %s remains queued for its durable turn lease", session_id)
             except Exception as e:
                 logger.exception("Agent error in session %s", session_id)
                 return {"final_response": f"Error: {e}", "messages": state.history}
@@ -845,7 +854,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 await self._drain_queued_prompts(state, session_id, self._conn)
                 return PromptResponse(stop_reason="end_turn")
 
-        absorbed = self._claim_turn_or_queue(state, session_id, user_text, user_content, text_only_prompt)
+        absorbed = self._claim_turn_or_queue(state, user_text, prompt)
         if absorbed is not None:
             if self._conn:
                 await self._conn.session_update(session_id, acp.update_agent_message_text(absorbed))
@@ -853,8 +862,6 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
 
         logger.info("Prompt on session %s: %s", session_id, user_text[:100])
         conn, loop = self._conn, asyncio.get_running_loop()
-        if state.cancel_event:
-            state.cancel_event.clear()
         cbs = self._wire_turn_callbacks(state, session_id, conn, loop)
 
         def _run_agent() -> dict:
@@ -880,6 +887,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             with state.runtime_lock:
                 state.is_running = False
                 state.current_prompt_text = ""
+            await self._drain_queued_prompts(state, session_id, conn)
             return PromptResponse(stop_reason="end_turn")
 
         return await self._finish_turn(state, session_id, conn, result, pre_turn_hermes_id, cbs.streamed)
@@ -980,7 +988,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 
             interrupted = bool(result.get("interrupted")) or cancelled
-            suppress = interrupted and final_response.startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX)
+            suppress = cancelled or (interrupted and final_response.startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX))
             # Send the final text unless already streamed — or if a plugin hook transformed it after.
             if final_response and conn and not suppress and (not streamed_message or result.get("response_transformed")):
                 update = acp.update_agent_message_text(final_response)
@@ -997,6 +1005,13 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         finally:
             # Go idle before draining so recursive prompt() calls can acquire the session.
             with state.runtime_lock:
+                # /steer shares this lock: also collect guidance accepted after the core
+                # finalizer drained its mailbox but before ACP published the idle state.
+                drain_steer = getattr(state.agent, "_drain_pending_steer", None)
+                late_steer = drain_steer() if callable(drain_steer) else None
+                for pending_steer in (late_steer, result.get("pending_steer")):
+                    if isinstance(pending_steer, str) and pending_steer:
+                        state.queued_prompts.insert(0, [TextContentBlock(type="text", text=pending_steer)])
                 state.is_running = False
                 state.current_prompt_text = ""
             await self._drain_queued_prompts(state, session_id, conn)
@@ -1020,8 +1035,14 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                     return
                 next_prompt = state.queued_prompts.pop(0)
             if conn:
-                await conn.session_update(session_id, acp.update_user_message_text(next_prompt))
-            await self.prompt(prompt=[TextContentBlock(type="text", text=next_prompt)], session_id=session_id)
+                try:
+                    for block in next_prompt:
+                        await conn.session_update(session_id, UserMessageChunk(
+                            session_update="user_message_chunk", content=block,
+                        ))
+                except Exception:
+                    logger.debug("Could not echo queued ACP prompt for %s", session_id, exc_info=True)
+            await self.prompt(prompt=next_prompt, session_id=session_id)
 
     # ---- Session settings (ACP protocol methods) -----------------------------
 

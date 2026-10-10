@@ -193,7 +193,9 @@ def test_acp_set_session_model_does_not_run_queued_prompts_inside_the_rpc(monkey
                         lambda **_kw: ModelSwitchResult(success=False, error_message="`nope` is not a model"))
     agent, _made = _acp_agent()
     state = _state()
-    state.queued_prompts = ["hello, queued mid-switch"]
+    from acp.schema import TextContentBlock
+
+    state.queued_prompts = [[TextContentBlock(type="text", text="hello, queued mid-switch")]]
     agent.session_manager.get_session = lambda sid: state
 
     class _Conn:

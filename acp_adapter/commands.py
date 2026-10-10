@@ -7,7 +7,7 @@ import logging
 from collections import Counter
 from typing import Any
 
-from acp.schema import AvailableCommand, AvailableCommandsUpdate, UnstructuredCommandInput
+from acp.schema import AvailableCommand, AvailableCommandsUpdate, TextContentBlock, UnstructuredCommandInput
 
 from acp_adapter.session import SessionState, _expand_acp_enabled_toolsets
 
@@ -27,7 +27,7 @@ def _estimate_tokens(history: list, agent: Any, system_prompt: str | None = None
 
 def _queue_prompt(state: SessionState, text: str) -> int:
     with state.runtime_lock:
-        state.queued_prompts.append(text)
+        state.queued_prompts.append([TextContentBlock(type="text", text=text)])
         return len(state.queued_prompts)
 
 
@@ -289,14 +289,15 @@ class SlashCommandsMixin:
         if not steer_text:
             return "Usage: /steer <guidance>"
 
-        if state.is_running and hasattr(state.agent, "steer"):
-            try:
-                if state.agent.steer(steer_text):
-                    preview = steer_text[:80] + ("..." if len(steer_text) > 80 else "")
-                    return f"⏩ Steer queued for the active turn: {preview}"
-            except Exception as exc:
-                logger.warning("ACP steer failed for session %s: %s", state.session_id, exc)
-                return f"⚠️ Steer failed: {exc}"
+        with state.runtime_lock:
+            cancelling = state.cancel_event and state.cancel_event.is_set()
+            if state.is_running and not cancelling and hasattr(state.agent, "steer"):
+                try:
+                    if state.agent.steer(steer_text):
+                        preview = steer_text[:80] + ("..." if len(steer_text) > 80 else "")
+                        return f"⏩ Steer queued for the active turn: {preview}"
+                except Exception as exc:
+                    logger.warning("ACP steer failed for session %s: %s", state.session_id, exc)
 
         return f"No active turn — queued for the next turn. ({_queue_prompt(state, steer_text)} queued)"
 
